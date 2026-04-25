@@ -142,6 +142,13 @@ function buildVendorIndex(vendor) {
   };
 }
 
+function getCoverageSummary(vendor) {
+  const serviceLocations = Array.isArray(vendor.service_locations) ? vendor.service_locations.filter(Boolean) : [];
+  if (serviceLocations.length) return serviceLocations.join(', ');
+  const region = [vendor.city, vendor.state, vendor.country].filter(Boolean).join(', ');
+  return region || vendor.final_contact_address || vendor.location_text || 'Location not listed';
+}
+
 function tokensMatchAll(haystack, tokens) {
   return tokens.every((token) => haystack.includes(token));
 }
@@ -360,7 +367,7 @@ function clearMapMarkers() {
 function groupMapPoints(entries) {
   const groups = new Map();
   entries.forEach((entry) => {
-    const key = `${entry.point.lat.toFixed(3)}|${entry.point.lng.toFixed(3)}`;
+    const key = `${entry.point.lat.toFixed(5)}|${entry.point.lng.toFixed(5)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(entry);
   });
@@ -373,7 +380,7 @@ function buildPopupHtml(entries) {
 
 function createRingPoints(point, count) {
   if (count <= 1) return [point];
-  const radius = Math.min(0.08, 0.012 + (count * 0.0025));
+  const radius = Math.min(0.14, 0.02 + (count * 0.004));
   return Array.from({ length: count }, (_, index) => {
     const angle = (Math.PI * 2 * index) / count;
     const latOffset = Math.sin(angle) * radius;
@@ -385,12 +392,11 @@ function createRingPoints(point, count) {
   });
 }
 
-function buildMarkerHtml(count) {
-  const size = count > 1 ? 34 : 20;
-  const halo = count > 1 ? 10 : 7;
-  const border = count > 1 ? 4 : 3;
-  const label = count > 1 ? `<span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font:700 13px/1 'Segoe UI',Arial,sans-serif;">${count}</span>` : '';
-  return `<div style="position:relative;width:${size}px;height:${size}px;border-radius:999px;background:#1976d2;border:${border}px solid #fff;box-shadow:0 0 0 ${halo}px rgba(25,118,210,.18),0 8px 18px rgba(25,118,210,.28);">${label}</div>`;
+function buildMarkerHtml(isRingMarker) {
+  const size = isRingMarker ? 18 : 20;
+  const halo = isRingMarker ? 5 : 7;
+  const border = isRingMarker ? 3 : 3;
+  return `<div style="position:relative;width:${size}px;height:${size}px;border-radius:999px;background:#1976d2;border:${border}px solid #fff;box-shadow:0 0 0 ${halo}px rgba(25,118,210,.18),0 8px 18px rgba(25,118,210,.28);"></div>`;
 }
 
 async function renderMapMarkers(vendors) {
@@ -417,12 +423,14 @@ async function renderMapMarkers(vendors) {
     const [{ point }] = entries;
     const ringPoints = createRingPoints(point, entries.length);
     entries.forEach((entry, index) => {
+      const isRingMarker = entries.length > 1;
+      const markerSize = isRingMarker ? 18 : 20;
       const marker = new window.mappls.Marker({
         map: directoryState.map,
         position: ringPoints[index],
-        html: buildMarkerHtml(entries.length),
-        width: entries.length > 1 ? 34 : 20,
-        height: entries.length > 1 ? 34 : 20,
+        html: buildMarkerHtml(isRingMarker),
+        width: markerSize,
+        height: markerSize,
         popupHtml: buildPopupHtml([entry]),
         fitbounds: false,
       });
@@ -486,7 +494,11 @@ async function renderResults() {
   resultsSummaryEl.textContent = `${totalMatches} organization result${totalMatches === 1 ? '' : 's'} found. Page ${directoryState.currentPage} of ${totalPages}.`;
 
   mapVendors.forEach((vendor, index) => {
-    mapListEl.insertAdjacentHTML('beforeend', `<div class="vendor-map-list-item" data-focus-vendor="${esc(vendor.portal_vendor_id)}"><span class="vendor-flag">${index + 1}</span><span><strong>${esc(vendor.vendor_name)}</strong><br /><small>${esc(vendor.location_text || 'Location not listed')}</small><br /><small>${esc(vendor.final_contact_address || vendor.final_contact_email || 'Contact details available on detail page')}</small></span><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></div>`);
+    const coverageSummary = getCoverageSummary(vendor);
+    const secondaryLine = vendor.final_contact_address && normalizeText(vendor.final_contact_address) !== normalizeText(coverageSummary)
+      ? vendor.final_contact_address
+      : vendor.final_contact_email || 'Contact details available on detail page';
+    mapListEl.insertAdjacentHTML('beforeend', `<div class="vendor-map-list-item" data-focus-vendor="${esc(vendor.portal_vendor_id)}"><span class="vendor-flag">${index + 1}</span><span><strong>${esc(vendor.vendor_name)}</strong><br /><small>${esc(coverageSummary)}</small><br /><small>${esc(secondaryLine)}</small></span><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></div>`);
   });
 
   pageVendors.forEach((vendor) => {
@@ -494,7 +506,11 @@ async function renderResults() {
     const productExtra = Math.max((vendor.products || []).length - productPreview.length, 0);
     const contactLine = [vendor.final_contact_email || vendor.portal_email || 'No email', vendor.final_contact_phone || vendor.portal_phone || 'No phone'].join(' | ');
     const noteLine = vendor.contact_notes || vendor.website_status || 'Innovation Guild contacts only';
-    resultsEl.insertAdjacentHTML('beforeend', `<article class="vendor-result-card" data-vendor-card="${esc(vendor.portal_vendor_id)}"><div class="vendor-result-top"><div><h4>${esc(vendor.vendor_name)}</h4><p>${esc(vendor.location_text || 'Location not listed')}</p></div><span class="admin-badge approved">${esc(String(vendor.products_count || vendor.products?.length || 0))} machines</span></div><p>${esc(vendor.about_vendor || 'No description available.')}</p><p><strong>Service locations:</strong> ${esc((vendor.service_locations || []).join(', ') || 'Not listed')}</p><p><strong>Contact:</strong> ${esc(contactLine)}</p><p><strong>Address:</strong> ${esc(vendor.final_contact_address || 'Not listed')}</p><p><strong>Enrichment:</strong> ${esc(noteLine)}</p><p><strong>Machines:</strong> ${esc(productPreview.join(', ') || 'No machines listed')}${productExtra ? ` +${productExtra} more` : ''}</p><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></article>`);
+    const coverageSummary = getCoverageSummary(vendor);
+    const addressLine = vendor.final_contact_address && normalizeText(vendor.final_contact_address) !== normalizeText(coverageSummary)
+      ? `<p><strong>Address:</strong> ${esc(vendor.final_contact_address)}</p>`
+      : '';
+    resultsEl.insertAdjacentHTML('beforeend', `<article class="vendor-result-card" data-vendor-card="${esc(vendor.portal_vendor_id)}"><div class="vendor-result-top"><div><h4>${esc(vendor.vendor_name)}</h4><p>${esc(coverageSummary)}</p></div><span class="admin-badge approved">${esc(String(vendor.products_count || vendor.products?.length || 0))} machines</span></div><p>${esc(vendor.about_vendor || 'No description available.')}</p><p><strong>Service locations:</strong> ${esc((vendor.service_locations || []).join(', ') || 'Not listed')}</p><p><strong>Contact:</strong> ${esc(contactLine)}</p>${addressLine}<p><strong>Enrichment:</strong> ${esc(noteLine)}</p><p><strong>Machines:</strong> ${esc(productPreview.join(', ') || 'No machines listed')}${productExtra ? ` +${productExtra} more` : ''}</p><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></article>`);
   });
 
   const selectedVendor = directoryState.selectedVendorId && mapVendors.some((vendor) => vendor.portal_vendor_id === directoryState.selectedVendorId)
