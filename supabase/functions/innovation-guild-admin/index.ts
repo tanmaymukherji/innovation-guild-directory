@@ -189,6 +189,61 @@ function uniqueBy<T>(items: T[], getKey: (item: T) => string) {
   return output;
 }
 
+function normalizeGeocodeQuery(value: string) {
+  return requireString(value)
+    .replace(/#/g, " ")
+    .replace(/\s*-\s*/g, ", ")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim();
+}
+
+function buildGeocodeQueries(address: string, state: string, country: string, locationText: string) {
+  const cleanedAddress = normalizeGeocodeQuery(address);
+  const cleanedState = normalizeGeocodeQuery(state);
+  const cleanedCountry = normalizeGeocodeQuery(country);
+  const primaryLocation = normalizeGeocodeQuery(locationText.split("|")[0] || "");
+  const queries = [
+    [cleanedAddress, cleanedState, cleanedCountry].filter(Boolean).join(", "),
+    [primaryLocation, cleanedState, cleanedCountry].filter(Boolean).join(", "),
+  ];
+
+  const addressParts = cleanedAddress.split(",").map((part) => part.trim()).filter(Boolean);
+  for (let take = Math.min(4, addressParts.length); take >= 2; take -= 1) {
+    queries.push([...addressParts.slice(-take), cleanedState, cleanedCountry].filter(Boolean).join(", "));
+  }
+
+  queries.push([cleanedState, cleanedCountry].filter(Boolean).join(", "));
+  queries.push(cleanedCountry);
+  return dedupeLocations(queries);
+}
+
+async function geocodeAddressFallback(address: string, state: string, country: string, locationText: string) {
+  const queries = buildGeocodeQueries(address, state, country, locationText);
+  for (const query of queries) {
+    if (!query) continue;
+    try {
+      const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`, {
+        headers: {
+          Accept: "application/json",
+          "User-Agent": "Innovation Guild Directory Sync/1.0",
+        },
+      });
+      if (!response.ok) continue;
+      const data = await response.json() as Array<Record<string, unknown>>;
+      const match = Array.isArray(data) ? data[0] : null;
+      const lat = toUsableCoordinate(match?.lat);
+      const lng = toUsableCoordinate(match?.lon);
+      if (lat !== null && lng !== null) {
+        return { latitude: lat, longitude: lng };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return { latitude: null, longitude: null };
+}
+
 async function hashToken(token: string) {
   const bytes = new TextEncoder().encode(token);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
@@ -473,7 +528,7 @@ async function handleSyncInnovationGuildDirectory(token: string) {
       };
     }).filter((row) => row.portal_product_id && row.portal_vendor_id);
 
-    const vendorRows = uniqueBy(productRows.map((product) => {
+    const rawVendorRows = uniqueBy(productRows.map((product) => {
       const detail = product.raw_product.detail as InnovationDetail;
       const orgDetails = detail.opportunityOrgDetails as Record<string, unknown> | undefined;
       const vendorId = product.portal_vendor_id;
@@ -543,6 +598,29 @@ async function handleSyncInnovationGuildDirectory(token: string) {
         updated_at: new Date().toISOString(),
       };
     }), (row) => requireString(row.portal_vendor_id));
+
+    const vendorRows = await mapLimit(rawVendorRows, 6, async (row) => {
+      const lat = toUsableCoordinate(row.latitude);
+      const lng = toUsableCoordinate(row.longitude);
+      if (lat !== null && lng !== null) {
+        return {
+          ...row,
+          latitude: lat,
+          longitude: lng,
+        };
+      }
+      const geocoded = await geocodeAddressFallback(
+        requireString(row.final_contact_address),
+        requireString(row.state),
+        requireString(row.country),
+        requireString(row.location_text),
+      );
+      return {
+        ...row,
+        latitude: geocoded.latitude,
+        longitude: geocoded.longitude,
+      };
+    });
 
     await upsertInBatches("innovation_guild_vendors", vendorRows, "portal_vendor_id", 100);
     await upsertInBatches("innovation_guild_products", productRows, "portal_product_id", 100);
