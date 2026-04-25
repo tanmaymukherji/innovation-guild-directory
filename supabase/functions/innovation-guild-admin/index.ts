@@ -112,7 +112,9 @@ function locationContainedInAddress(address: string, candidate: string) {
   const addressValue = locationKey(address);
   const candidateValue = locationKey(candidate);
   if (!addressValue || !candidateValue) return false;
-  return addressValue === candidateValue || addressValue.endsWith(candidateValue) || addressValue.includes(`, ${candidateValue}`);
+  if (addressValue === candidateValue || addressValue.endsWith(candidateValue) || addressValue.includes(`, ${candidateValue}`)) return true;
+  const parts = candidateValue.split(",").map((part) => part.trim()).filter(Boolean);
+  return parts.length > 1 && parts.every((part) => addressValue.includes(part));
 }
 
 function buildVendorCoverageLocations(values: unknown[], primaryAddress: string, state: string, country: string) {
