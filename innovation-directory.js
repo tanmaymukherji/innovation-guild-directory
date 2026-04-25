@@ -149,6 +149,14 @@ function getCoverageSummary(vendor) {
   return region || vendor.final_contact_address || vendor.location_text || 'Location not listed';
 }
 
+function getPrimaryLocationLabel(vendor) {
+  const finalAddress = String(vendor.final_contact_address || '').trim();
+  if (finalAddress) return finalAddress;
+  const locationText = String(vendor.location_text || '').split('|')[0]?.trim();
+  if (locationText) return locationText;
+  return [vendor.city, vendor.state, vendor.country].filter(Boolean).join(', ');
+}
+
 function tokensMatchAll(haystack, tokens) {
   return tokens.every((token) => haystack.includes(token));
 }
@@ -367,7 +375,8 @@ function clearMapMarkers() {
 function groupMapPoints(entries) {
   const groups = new Map();
   entries.forEach((entry) => {
-    const key = `${entry.point.lat.toFixed(5)}|${entry.point.lng.toFixed(5)}`;
+    const locationKey = normalizeText(getPrimaryLocationLabel(entry.vendor));
+    const key = locationKey || `${entry.point.lat.toFixed(4)}|${entry.point.lng.toFixed(4)}`;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(entry);
   });
@@ -420,8 +429,13 @@ async function renderMapMarkers(vendors) {
   }
   const groupedPoints = groupMapPoints(points);
   groupedPoints.forEach((entries) => {
-    const [{ point }] = entries;
-    const ringPoints = createRingPoints(point, entries.length);
+    const basePoint = entries.length === 1
+      ? entries[0].point
+      : {
+          lat: entries.reduce((sum, entry) => sum + Number(entry.point.lat || 0), 0) / entries.length,
+          lng: entries.reduce((sum, entry) => sum + Number(entry.point.lng || 0), 0) / entries.length,
+        };
+    const ringPoints = createRingPoints(basePoint, entries.length);
     entries.forEach((entry, index) => {
       const isRingMarker = entries.length > 1;
       const markerSize = isRingMarker ? 18 : 20;
