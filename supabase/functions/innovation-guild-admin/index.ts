@@ -78,6 +78,55 @@ function dedupe(values: string[]) {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
+function normalizeLocationValue(value: unknown) {
+  return requireString(value)
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\s*\|\s*/g, " | ")
+    .trim();
+}
+
+function locationKey(value: unknown) {
+  return normalizeLocationValue(value).toLowerCase();
+}
+
+function dedupeLocations(values: unknown[]) {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const normalized = normalizeLocationValue(value);
+    const key = locationKey(normalized);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function mentionsStateCountry(address: string, stateCountry: string) {
+  if (!address || !stateCountry) return false;
+  return locationKey(address).includes(locationKey(stateCountry));
+}
+
+function locationContainedInAddress(address: string, candidate: string) {
+  const addressValue = locationKey(address);
+  const candidateValue = locationKey(candidate);
+  if (!addressValue || !candidateValue) return false;
+  return addressValue === candidateValue || addressValue.endsWith(candidateValue) || addressValue.includes(`, ${candidateValue}`);
+}
+
+function buildVendorCoverageLocations(values: unknown[], primaryAddress: string, state: string, country: string) {
+  const cleanedAddress = normalizeLocationValue(primaryAddress);
+  const stateCountry = normalizeLocationValue([state, country].filter(Boolean).join(", "));
+  return dedupeLocations(values).filter((value) => {
+    const key = locationKey(value);
+    if (!key) return false;
+    if (cleanedAddress && locationContainedInAddress(cleanedAddress, value)) return false;
+    if (stateCountry && key === locationKey(stateCountry) && mentionsStateCountry(cleanedAddress, stateCountry)) return false;
+    return true;
+  });
+}
+
 function toNullableNumber(value: unknown) {
   const num = typeof value === "number" ? value : Number(value);
   return Number.isFinite(num) ? num : null;
@@ -240,8 +289,8 @@ function buildLocations(detail: InnovationDetail) {
   const entity = getEntityLocation(detail);
   const sales = locations.filter((entry) => requireString(entry.type) === "LOCATION_TYPE.SALES_LOCATIONS").map((entry) => [requireString(entry.stateLabel), requireString(entry.countryLabel)].filter(Boolean).join(", "));
   const manufactured = locations.filter((entry) => requireString(entry.type) === "LOCATION_TYPE.INNOVATION_MANUFACTURED").map((entry) => [requireString(entry.stateLabel), requireString(entry.countryLabel)].filter(Boolean).join(", "));
-  return dedupe([
-    requireString(entity?.addressLine1),
+  return dedupeLocations([
+    normalizeLocationValue(entity?.addressLine1),
     ...sales,
     ...manufactured,
     [requireString(entity?.stateLabel), requireString(entity?.countryLabel)].filter(Boolean).join(", "),
@@ -429,22 +478,24 @@ async function handleSyncInnovationGuildDirectory(token: string) {
       const vendorName = product.vendor_name;
       const seed = seedMap.byId.get(vendorId) || seedMap.byName.get(normalizeText(vendorName));
       const entityLocation = getEntityLocation(detail);
-      const serviceLocations = dedupe(productRows.filter((entry) => entry.portal_vendor_id === vendorId).flatMap((entry) => {
-        const value = requireString(entry.product_location_text);
-        return value ? value.split("|").map((item) => item.trim()).filter(Boolean) : [];
-      }));
-      const derivedAddress = requireString(entityLocation?.addressLine1) || serviceLocations[0] || "";
+      const linkedProducts = productRows.filter((entry) => entry.portal_vendor_id === vendorId);
+      const state = normalizeLocationValue(entityLocation?.stateLabel) || null;
+      const country = normalizeLocationValue(entityLocation?.countryLabel) || null;
+      const rawVendorLocations = linkedProducts.flatMap((entry) => {
+        const productDetail = entry.raw_product.detail as InnovationDetail;
+        return buildLocations(productDetail);
+      });
+      const fallbackAddress = dedupeLocations(rawVendorLocations)[0] || "";
+      const derivedAddress = normalizeLocationValue(entityLocation?.addressLine1) || fallbackAddress;
       const mergedContacts = mergeContactDetails(seed, derivedAddress, product.product_link || `${innovationSiteBaseUrl}/innovation/home`);
       const lat = mergedContacts.latitude ?? toUsableCoordinate(entityLocation?.latitude);
       const lng = mergedContacts.longitude ?? toUsableCoordinate(entityLocation?.longitude);
-      const linkedProducts = productRows.filter((entry) => entry.portal_vendor_id === vendorId);
-      const state = requireString(entityLocation?.stateLabel) || null;
-      const country = requireString(entityLocation?.countryLabel) || null;
-      const locationText = dedupe([
-        requireString(entityLocation?.addressLine1),
+      const finalAddress = normalizeLocationValue(mergedContacts.finalAddress) || null;
+      const serviceLocations = buildVendorCoverageLocations(rawVendorLocations, finalAddress || derivedAddress, state || "", country || "");
+      const locationText = dedupeLocations([
+        finalAddress || derivedAddress,
         ...serviceLocations,
-        [state, country].filter(Boolean).join(", "),
-      ]).filter(Boolean).join(" | ");
+      ]).join(" | ");
       return {
         portal_vendor_id: vendorId,
         vendor_name: vendorName,
@@ -465,7 +516,7 @@ async function handleSyncInnovationGuildDirectory(token: string) {
         website_address: mergedContacts.websiteAddress,
         final_contact_email: mergedContacts.finalEmail,
         final_contact_phone: mergedContacts.finalPhone,
-        final_contact_address: mergedContacts.finalAddress,
+        final_contact_address: finalAddress,
         contact_source_url: mergedContacts.contactSourceUrl,
         website_status: mergedContacts.websiteStatus,
         legacy_products_links: linkedProducts.map((entry) => entry.product_link).filter(Boolean).join("\n"),
