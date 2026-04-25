@@ -1,0 +1,566 @@
+const directoryState = {
+  vendors: [],
+  products: [],
+  filteredVendors: [],
+  currentPage: 1,
+  pageSize: 12,
+  hasSearched: false,
+  geocodeCache: new Map(),
+  map: null,
+  mapReady: false,
+  mapLoadPromise: null,
+  markers: [],
+  selectedVendorId: null,
+};
+
+const INDIA_CENTER = { lat: 22.9734, lng: 78.6569 };
+const SEARCH_STATE_KEY = 'innovation_guild_search_state_v1';
+const searchEls = {
+  supplier: document.getElementById('search-supplier'),
+  product: document.getElementById('search-product'),
+  tags: document.getElementById('search-tags'),
+  location: document.getElementById('search-location'),
+  keyword: document.getElementById('search-keyword'),
+};
+
+const resultsEl = document.getElementById('vendor-results');
+const mapListEl = document.getElementById('map-results-list');
+const statusEl = document.getElementById('directory-status');
+const resultsSummaryEl = document.getElementById('results-summary');
+const paginationEls = [
+  document.getElementById('results-pagination-top'),
+  document.getElementById('results-pagination-bottom'),
+];
+
+function esc(value) {
+  return String(value || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+}
+
+function persistSearchState() {
+  const snapshot = {
+    search: {
+      supplier: searchEls.supplier.value,
+      product: searchEls.product.value,
+      tags: searchEls.tags.value,
+      location: searchEls.location.value,
+      keyword: searchEls.keyword.value,
+    },
+    currentPage: directoryState.currentPage,
+    hasSearched: directoryState.hasSearched,
+    selectedVendorId: directoryState.selectedVendorId,
+  };
+  try {
+    window.sessionStorage.setItem(SEARCH_STATE_KEY, JSON.stringify(snapshot));
+  } catch {}
+}
+
+function restoreSearchState() {
+  try {
+    const raw = window.sessionStorage.getItem(SEARCH_STATE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function applySearchSnapshot(snapshot) {
+  if (!snapshot?.search) return;
+  searchEls.supplier.value = String(snapshot.search.supplier || '');
+  searchEls.product.value = String(snapshot.search.product || '');
+  searchEls.tags.value = String(snapshot.search.tags || '');
+  searchEls.location.value = String(snapshot.search.location || '');
+  searchEls.keyword.value = String(snapshot.search.keyword || '');
+  directoryState.currentPage = Number(snapshot.currentPage || 1);
+  directoryState.selectedVendorId = snapshot.selectedVendorId || null;
+}
+
+function normalizeText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function tokenize(value) {
+  return normalizeText(value).split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+function buildVendorIndex(vendor) {
+  const productNames = (vendor.products || []).map((product) => normalizeText(product.product_name)).join(' ');
+  const productDescriptions = (vendor.products || []).map((product) => normalizeText(product.product_description)).join(' ');
+  const tags = [
+    ...(vendor.tags || []),
+    ...(vendor.products || []).flatMap((product) => product.tags || []),
+    ...(vendor.products || []).flatMap((product) => (product.product_specifications || []).flatMap((spec) => [spec?.key, spec?.value])),
+    ...(vendor.products || []).flatMap((product) => product.product_categories || []),
+    ...(vendor.products || []).flatMap((product) => product.product_subcategories || []),
+  ].map(normalizeText).join(' ');
+  const locations = [vendor.location_text, vendor.city, vendor.state, vendor.country, vendor.final_contact_address, ...(vendor.service_locations || [])].map(normalizeText).join(' ');
+  const contacts = [vendor.portal_contact_name, vendor.portal_email, vendor.portal_phone, vendor.website_email, vendor.website_phone, vendor.final_contact_email, vendor.final_contact_phone].map(normalizeText).join(' ');
+  const website = [vendor.website_details, vendor.website_status, vendor.contact_notes, vendor.legacy_products_links].map(normalizeText).join(' ');
+  const keyword = [vendor.vendor_name, vendor.about_vendor, productNames, productDescriptions, tags, locations, contacts, website, vendor.search_text].map(normalizeText).join(' ');
+  return {
+    supplier: normalizeText(vendor.vendor_name),
+    products: productNames,
+    tags,
+    location: locations,
+    keyword,
+  };
+}
+
+function tokensMatchAll(haystack, tokens) {
+  return tokens.every((token) => haystack.includes(token));
+}
+
+function scoreAgainstTokens(haystack, tokens, weight) {
+  if (!tokens.length) return 0;
+  let score = 0;
+  for (const token of tokens) {
+    if (!haystack.includes(token)) return null;
+    score += haystack === token ? weight * 3 : haystack.startsWith(token) ? weight * 2 : weight;
+  }
+  return score;
+}
+
+function scoreVendor(vendor, filters) {
+  const index = vendor._searchIndex || (vendor._searchIndex = buildVendorIndex(vendor));
+  let score = 0;
+
+  const supplierScore = scoreAgainstTokens(index.supplier, filters.supplierTokens, 22);
+  if (supplierScore === null) return null;
+  score += supplierScore;
+
+  const productScore = scoreAgainstTokens(index.products, filters.productTokens, 18);
+  if (productScore === null) return null;
+  score += productScore;
+
+  const tagScore = scoreAgainstTokens(index.tags, filters.tagTokens, 10);
+  if (tagScore === null) return null;
+  score += tagScore;
+
+  const locationScore = scoreAgainstTokens(index.location, filters.locationTokens, 12);
+  if (locationScore === null) return null;
+  score += locationScore;
+
+  if (filters.keywordTokens.length) {
+    if (!tokensMatchAll(index.keyword, filters.keywordTokens)) return null;
+    score += filters.keywordTokens.reduce((total, token) => total + (index.supplier.includes(token) ? 20 : 8), 0);
+  }
+
+  if (filters.keywordPhrase && index.keyword.includes(filters.keywordPhrase)) score += 35;
+  if (filters.supplierPhrase && index.supplier.includes(filters.supplierPhrase)) score += 25;
+  if ((vendor.products_count || vendor.products?.length || 0) > 0) score += 3;
+  if (vendor.final_contact_address) score += 2;
+  if (vendor.latitude && vendor.longitude) score += 4;
+
+  return score;
+}
+
+function getFilters() {
+  const supplier = normalizeText(searchEls.supplier.value);
+  const product = normalizeText(searchEls.product.value);
+  const tags = normalizeText(searchEls.tags.value);
+  const location = normalizeText(searchEls.location.value);
+  const keyword = normalizeText(searchEls.keyword.value);
+  return {
+    supplierPhrase: supplier,
+    productPhrase: product,
+    tagPhrase: tags,
+    locationPhrase: location,
+    keywordPhrase: keyword,
+    supplierTokens: tokenize(supplier),
+    productTokens: tokenize(product),
+    tagTokens: tokenize(tags),
+    locationTokens: tokenize(location),
+    keywordTokens: tokenize(keyword),
+  };
+}
+
+function hasAnyFilter(filters) {
+  return Boolean(
+    filters.supplierTokens.length ||
+    filters.productTokens.length ||
+    filters.tagTokens.length ||
+    filters.locationTokens.length ||
+    filters.keywordTokens.length
+  );
+}
+
+function setCounts() {
+  document.getElementById('vendor-total-count').textContent = String(directoryState.vendors.length);
+  document.getElementById('product-total-count').textContent = String(directoryState.products.length);
+  document.getElementById('filtered-vendor-count').textContent = String(directoryState.filteredVendors.length);
+}
+
+function getPageCount() {
+  return Math.max(1, Math.ceil(directoryState.filteredVendors.length / directoryState.pageSize));
+}
+
+function getPageResults() {
+  const start = (directoryState.currentPage - 1) * directoryState.pageSize;
+  return directoryState.filteredVendors.slice(start, start + directoryState.pageSize);
+}
+
+function setSelectedVendor(vendorId) {
+  directoryState.selectedVendorId = vendorId || null;
+  document.querySelectorAll('[data-vendor-card]').forEach((card) => {
+    card.classList.toggle('active', card.dataset.vendorCard === vendorId);
+  });
+  document.querySelectorAll('[data-focus-vendor]').forEach((item) => {
+    item.classList.toggle('active', item.dataset.focusVendor === vendorId);
+  });
+}
+
+function focusVendor(vendorId, options = {}) {
+  if (!vendorId) return;
+  const shouldScroll = Boolean(options.scroll);
+  setSelectedVendor(vendorId);
+  persistSearchState();
+  if (!shouldScroll) return;
+  const escapedId = window.CSS?.escape ? window.CSS.escape(vendorId) : vendorId.replace(/"/g, '\\"');
+  const card = document.querySelector(`[data-vendor-card="${escapedId}"]`);
+  if (card) card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function ensureMapCss() {
+  if (document.getElementById('mappls-web-sdk-css')) return;
+  const link = document.createElement('link');
+  link.id = 'mappls-web-sdk-css';
+  link.rel = 'stylesheet';
+  link.href = 'https://apis.mappls.com/vector_map/assets/v3.5/mappls-glob.css';
+  document.head.appendChild(link);
+}
+
+async function loadMapSdk() {
+  const key = String(window.APP_CONFIG?.MAPMYINDIA_MAP_KEY || '').trim();
+  if (!key) {
+    document.getElementById('results-map').innerHTML = '<div class="vendor-map-placeholder">Add `MAPMYINDIA_MAP_KEY` in `config.js` to enable the map.</div>';
+    return false;
+  }
+  if (window.mappls?.Map) return true;
+  ensureMapCss();
+  const urls = [
+    `https://sdk.mappls.com/map/sdk/web?v=3.0&access_token=${encodeURIComponent(key)}`,
+    `https://sdk.mappls.com/map/sdk/web?v=3.0&layer=vector&access_token=${encodeURIComponent(key)}`,
+    `https://apis.mappls.com/advancedmaps/api/${encodeURIComponent(key)}/map_sdk?layer=vector&v=3.0`,
+  ];
+  for (const src of urls) {
+    try {
+      await new Promise((resolve, reject) => {
+        document.querySelectorAll('script[data-mappls-sdk="true"]').forEach((node) => node.remove());
+        const script = document.createElement('script');
+        script.src = src;
+        script.async = true;
+        script.defer = true;
+        script.dataset.mapplsSdk = 'true';
+        script.onload = () => window.mappls?.Map ? resolve() : reject(new Error('Mappls SDK unavailable'));
+        script.onerror = reject;
+        document.head.appendChild(script);
+      });
+      return true;
+    } catch {}
+  }
+  document.getElementById('results-map').innerHTML = '<div class="vendor-map-placeholder">The MapMyIndia SDK could not be loaded for this page.</div>';
+  return false;
+}
+
+async function ensureMap() {
+  if (directoryState.mapReady) return true;
+  if (directoryState.mapLoadPromise) return await directoryState.mapLoadPromise;
+  const loaded = await loadMapSdk();
+  if (!loaded || !window.mappls?.Map) return false;
+  directoryState.mapLoadPromise = new Promise((resolve) => {
+    directoryState.map = new window.mappls.Map('results-map', {
+      center: INDIA_CENTER,
+      zoom: 4.8,
+      zoomControl: true,
+      geolocation: false,
+      location: false,
+    });
+    let settled = false;
+    const markReady = () => {
+      if (settled) return;
+      settled = true;
+      directoryState.mapReady = true;
+      resolve(true);
+    };
+    directoryState.map?.on?.('load', markReady);
+    directoryState.map?.addListener?.('load', markReady);
+    window.setTimeout(markReady, 1500);
+  });
+  return await directoryState.mapLoadPromise;
+}
+
+async function geocodeVendor(vendor) {
+  const cacheKey = vendor.portal_vendor_id;
+  if (directoryState.geocodeCache.has(cacheKey)) return directoryState.geocodeCache.get(cacheKey);
+  const lat = Number(vendor.latitude);
+  const lng = Number(vendor.longitude);
+  if (Number.isFinite(lat) && Number.isFinite(lng) && (Math.abs(lat) > 0.0001 || Math.abs(lng) > 0.0001)) {
+    const point = { lat: Number(vendor.latitude), lng: Number(vendor.longitude) };
+    directoryState.geocodeCache.set(cacheKey, point);
+    return point;
+  }
+  const query = [vendor.location_text, vendor.city, vendor.state, vendor.country, vendor.final_contact_address].filter(Boolean).join(', ');
+  if (!query) return null;
+  try {
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(query)}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const data = await response.json();
+    const match = Array.isArray(data) ? data[0] : null;
+    if (!match) return null;
+    const point = { lat: Number(match.lat), lng: Number(match.lon) };
+    directoryState.geocodeCache.set(cacheKey, point);
+    return point;
+  } catch {
+    return null;
+  }
+}
+
+function clearMapMarkers() {
+  directoryState.markers.forEach((marker) => marker?.remove?.());
+  directoryState.markers = [];
+}
+
+function groupMapPoints(entries) {
+  const groups = new Map();
+  entries.forEach((entry) => {
+    const key = `${entry.point.lat.toFixed(3)}|${entry.point.lng.toFixed(3)}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  });
+  return Array.from(groups.values());
+}
+
+function buildPopupHtml(entries) {
+  return `<div class="vendor-map-popup">${entries.map(({ vendor }) => `<div><strong>${esc(vendor.vendor_name)}</strong><br/>${esc(vendor.location_text || 'Location not listed')}<br/><a href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a> | <a href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div>`).join('<hr style="border:none;border-top:1px solid #dbe5eb;margin:.55rem 0;" />')}</div>`;
+}
+
+function createRingPoints(point, count) {
+  if (count <= 1) return [point];
+  const radius = Math.min(0.08, 0.012 + (count * 0.0025));
+  return Array.from({ length: count }, (_, index) => {
+    const angle = (Math.PI * 2 * index) / count;
+    const latOffset = Math.sin(angle) * radius;
+    const lngOffset = Math.cos(angle) * radius / Math.max(Math.cos((point.lat * Math.PI) / 180), 0.35);
+    return {
+      lat: point.lat + latOffset,
+      lng: point.lng + lngOffset,
+    };
+  });
+}
+
+function buildMarkerHtml(count) {
+  const size = count > 1 ? 34 : 20;
+  const halo = count > 1 ? 10 : 7;
+  const border = count > 1 ? 4 : 3;
+  const label = count > 1 ? `<span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font:700 13px/1 'Segoe UI',Arial,sans-serif;">${count}</span>` : '';
+  return `<div style="position:relative;width:${size}px;height:${size}px;border-radius:999px;background:#1976d2;border:${border}px solid #fff;box-shadow:0 0 0 ${halo}px rgba(25,118,210,.18),0 8px 18px rgba(25,118,210,.28);">${label}</div>`;
+}
+
+async function renderMapMarkers(vendors) {
+  const ready = await ensureMap();
+  if (!ready) return;
+  clearMapMarkers();
+  const points = [];
+  for (const vendor of vendors) {
+    const point = await geocodeVendor(vendor);
+    if (point) points.push({ vendor, point });
+  }
+  if (!points.length) {
+    if (!vendors.length) {
+      mapListEl.innerHTML = '<div class="vendor-map-status">No mappable coordinates were available for the current search yet.</div>';
+    } else {
+      mapListEl.insertAdjacentHTML('afterbegin', '<div class="vendor-map-status">Matching organizations are listed here, but no usable coordinates could be derived from the current data yet.</div>');
+    }
+    directoryState.map?.setCenter?.(INDIA_CENTER);
+    directoryState.map?.setZoom?.(4.8);
+    return;
+  }
+  const groupedPoints = groupMapPoints(points);
+  groupedPoints.forEach((entries) => {
+    const [{ point }] = entries;
+    const ringPoints = createRingPoints(point, entries.length);
+    entries.forEach((entry, index) => {
+      const marker = new window.mappls.Marker({
+        map: directoryState.map,
+        position: ringPoints[index],
+        html: buildMarkerHtml(entries.length),
+        width: entries.length > 1 ? 34 : 20,
+        height: entries.length > 1 ? 34 : 20,
+        popupHtml: buildPopupHtml([entry]),
+        fitbounds: false,
+      });
+      marker.on?.('click', () => focusVendor(entry.vendor.portal_vendor_id));
+      marker.addListener?.('click', () => focusVendor(entry.vendor.portal_vendor_id));
+      directoryState.markers.push(marker);
+    });
+  });
+  const indiaPoints = points.filter(({ point }) => point.lat >= 6 && point.lat <= 38 && point.lng >= 68 && point.lng <= 98);
+  const first = indiaPoints[0]?.point || points[0]?.point;
+  if (first) {
+    directoryState.map?.setCenter?.(first);
+    directoryState.map?.setZoom?.(5.5);
+  }
+}
+
+function renderPagination(totalPages, totalMatches) {
+  paginationEls.forEach((container) => {
+    if (!container) return;
+    container.innerHTML = '';
+    if (!directoryState.hasSearched || !totalMatches) return;
+    container.insertAdjacentHTML('beforeend', `<div class="vendor-page-summary">Showing ${getPageResults().length} of ${totalMatches} results</div>`);
+    const prevDisabled = directoryState.currentPage === 1 ? 'disabled' : '';
+    container.insertAdjacentHTML('beforeend', `<button class="btn btn-small btn-pagination" data-page-nav="prev" ${prevDisabled}>Prev</button>`);
+    const start = Math.max(1, directoryState.currentPage - 2);
+    const end = Math.min(totalPages, start + 4);
+    for (let page = start; page <= end; page += 1) {
+      container.insertAdjacentHTML('beforeend', `<button class="btn btn-small btn-pagination ${page === directoryState.currentPage ? 'active' : ''}" data-page-number="${page}">${page}</button>`);
+    }
+    const nextDisabled = directoryState.currentPage === totalPages ? 'disabled' : '';
+    container.insertAdjacentHTML('beforeend', `<button class="btn btn-small btn-pagination" data-page-nav="next" ${nextDisabled}>Next</button>`);
+  });
+}
+
+async function renderResults() {
+  const totalMatches = directoryState.filteredVendors.length;
+  const totalPages = getPageCount();
+  const pageVendors = getPageResults();
+  const mapVendors = directoryState.hasSearched ? directoryState.filteredVendors : [];
+  setCounts();
+  resultsEl.innerHTML = '';
+  mapListEl.innerHTML = '';
+  renderPagination(totalPages, totalMatches);
+
+  if (!directoryState.hasSearched) {
+    resultsSummaryEl.textContent = 'Enter an organization, machine, specification, location, or keyword to search the directory.';
+    resultsEl.innerHTML = '<div class="vendor-empty-state">The directory is loaded and ready. Start with a keyword or one of the filters on the left, then run the search to see matching Innovation Guild organizations.</div>';
+    mapListEl.innerHTML = '<div class="vendor-map-status">Run a search to display matching organization locations on the map.</div>';
+    await renderMapMarkers([]);
+    return;
+  }
+
+  if (!totalMatches) {
+    resultsSummaryEl.textContent = 'No organizations matched the current filters.';
+    resultsEl.innerHTML = '<div class="vendor-empty-state">No organizations match this combination yet. Try a shorter keyword, a broader location, or remove one filter at a time.</div>';
+    mapListEl.innerHTML = '<div class="vendor-map-status">No map results for the current search.</div>';
+    await renderMapMarkers([]);
+    return;
+  }
+
+  resultsSummaryEl.textContent = `${totalMatches} organization result${totalMatches === 1 ? '' : 's'} found. Page ${directoryState.currentPage} of ${totalPages}.`;
+
+  mapVendors.forEach((vendor, index) => {
+    mapListEl.insertAdjacentHTML('beforeend', `<div class="vendor-map-list-item" data-focus-vendor="${esc(vendor.portal_vendor_id)}"><span class="vendor-flag">${index + 1}</span><span><strong>${esc(vendor.vendor_name)}</strong><br /><small>${esc(vendor.location_text || 'Location not listed')}</small><br /><small>${esc(vendor.final_contact_address || vendor.final_contact_email || 'Contact details available on detail page')}</small></span><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></div>`);
+  });
+
+  pageVendors.forEach((vendor) => {
+    const productPreview = (vendor.products || []).slice(0, 4).map((product) => product.product_name).filter(Boolean);
+    const productExtra = Math.max((vendor.products || []).length - productPreview.length, 0);
+    const contactLine = [vendor.final_contact_email || vendor.portal_email || 'No email', vendor.final_contact_phone || vendor.portal_phone || 'No phone'].join(' | ');
+    const noteLine = vendor.contact_notes || vendor.website_status || 'Innovation Guild contacts only';
+    resultsEl.insertAdjacentHTML('beforeend', `<article class="vendor-result-card" data-vendor-card="${esc(vendor.portal_vendor_id)}"><div class="vendor-result-top"><div><h4>${esc(vendor.vendor_name)}</h4><p>${esc(vendor.location_text || 'Location not listed')}</p></div><span class="admin-badge approved">${esc(String(vendor.products_count || vendor.products?.length || 0))} machines</span></div><p>${esc(vendor.about_vendor || 'No description available.')}</p><p><strong>Service locations:</strong> ${esc((vendor.service_locations || []).join(', ') || 'Not listed')}</p><p><strong>Contact:</strong> ${esc(contactLine)}</p><p><strong>Address:</strong> ${esc(vendor.final_contact_address || 'Not listed')}</p><p><strong>Enrichment:</strong> ${esc(noteLine)}</p><p><strong>Machines:</strong> ${esc(productPreview.join(', ') || 'No machines listed')}${productExtra ? ` +${productExtra} more` : ''}</p><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></article>`);
+  });
+
+  const selectedVendor = directoryState.selectedVendorId && mapVendors.some((vendor) => vendor.portal_vendor_id === directoryState.selectedVendorId)
+    ? directoryState.selectedVendorId
+    : mapVendors[0]?.portal_vendor_id || null;
+  setSelectedVendor(selectedVendor);
+  persistSearchState();
+  await renderMapMarkers(mapVendors);
+}
+
+function applyFilters() {
+  const filters = getFilters();
+  if (!hasAnyFilter(filters)) {
+    directoryState.hasSearched = false;
+    directoryState.filteredVendors = [];
+    directoryState.currentPage = 1;
+    statusEl.textContent = `Loaded ${directoryState.vendors.length} organizations and ${directoryState.products.length} machines from the synced Innovation Guild directory.`;
+    renderResults();
+    return;
+  }
+  const scored = directoryState.vendors
+    .map((vendor) => ({ vendor, score: scoreVendor(vendor, filters) }))
+    .filter((entry) => entry.score !== null)
+    .sort((left, right) => right.score - left.score || left.vendor.vendor_name.localeCompare(right.vendor.vendor_name))
+    .map((entry) => entry.vendor);
+  directoryState.hasSearched = true;
+  directoryState.filteredVendors = scored;
+  directoryState.currentPage = 1;
+  persistSearchState();
+  renderResults();
+}
+
+function clearFilters() {
+  Object.values(searchEls).forEach((input) => { input.value = ''; });
+  directoryState.selectedVendorId = null;
+  try { window.sessionStorage.removeItem(SEARCH_STATE_KEY); } catch {}
+  applyFilters();
+}
+
+async function initializeDirectory() {
+  statusEl.textContent = 'Loading Innovation Guild directory from Supabase...';
+  try {
+    const { vendors, products } = await InnovationStore.loadDirectory();
+    directoryState.vendors = vendors;
+    directoryState.products = products;
+    directoryState.filteredVendors = [];
+    statusEl.textContent = `Loaded ${vendors.length} organizations and ${products.length} machines from the synced Innovation Guild directory.`;
+    const snapshot = restoreSearchState();
+    if (snapshot?.hasSearched) {
+      applySearchSnapshot(snapshot);
+      const filters = getFilters();
+      const scored = directoryState.vendors
+        .map((vendor) => ({ vendor, score: scoreVendor(vendor, filters) }))
+        .filter((entry) => entry.score !== null)
+        .sort((left, right) => right.score - left.score || left.vendor.vendor_name.localeCompare(right.vendor.vendor_name))
+        .map((entry) => entry.vendor);
+      directoryState.hasSearched = true;
+      directoryState.filteredVendors = scored;
+      directoryState.currentPage = Math.min(Math.max(1, directoryState.currentPage), Math.max(1, Math.ceil(scored.length / directoryState.pageSize)));
+    }
+    await renderResults();
+  } catch (error) {
+    statusEl.textContent = error.message || 'Innovation Guild directory could not be loaded.';
+    resultsEl.innerHTML = `<article class="admin-card"><p>${esc(statusEl.textContent)}</p></article>`;
+  }
+}
+
+document.getElementById('run-search').addEventListener('click', applyFilters);
+document.getElementById('clear-search').addEventListener('click', clearFilters);
+Object.values(searchEls).forEach((input) => {
+  input.addEventListener('keypress', (event) => { if (event.key === 'Enter') applyFilters(); });
+  input.addEventListener('input', persistSearchState);
+});
+mapListEl.addEventListener('click', (event) => {
+  if (event.target.closest('a')) return;
+  const target = event.target.closest('[data-focus-vendor]');
+  if (target) focusVendor(target.dataset.focusVendor);
+});
+resultsEl.addEventListener('click', (event) => {
+  if (event.target.closest('a')) return;
+  const target = event.target.closest('[data-vendor-card]');
+  if (target) {
+    setSelectedVendor(target.dataset.vendorCard);
+    persistSearchState();
+  }
+});
+paginationEls.forEach((container) => container?.addEventListener('click', (event) => {
+  const pageButton = event.target.closest('[data-page-number]');
+  if (pageButton) {
+    directoryState.currentPage = Number(pageButton.dataset.pageNumber);
+    persistSearchState();
+    renderResults();
+    return;
+  }
+  const navButton = event.target.closest('[data-page-nav]');
+  if (!navButton) return;
+  const direction = navButton.dataset.pageNav;
+  if (direction === 'prev' && directoryState.currentPage > 1) directoryState.currentPage -= 1;
+  if (direction === 'next' && directoryState.currentPage < getPageCount()) directoryState.currentPage += 1;
+  persistSearchState();
+  renderResults();
+}));
+
+initializeDirectory();
