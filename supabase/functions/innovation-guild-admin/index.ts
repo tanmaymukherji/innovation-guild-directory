@@ -14,6 +14,19 @@ const marketUuid = "COMMONS-INNOVATION_GUILD-2024";
 const innovationBaseUrl = "https://login.platformcommons.org";
 const innovationSiteBaseUrl = "https://innovationguild.in";
 let supabaseClient: ReturnType<typeof createClient> | null = null;
+const EDITABLE_VENDOR_FIELDS = [
+  "vendor_name",
+  "portal_contact_name",
+  "location_text",
+  "final_contact_email",
+  "final_contact_phone",
+  "final_contact_address",
+  "website_details",
+  "contact_source_url",
+  "website_status",
+  "about_vendor",
+  "contact_notes",
+] as const;
 
 type ContactSeedRecord = {
   vendor_id?: string;
@@ -302,6 +315,31 @@ async function handleLogout(token: string) {
   const tokenHash = await hashToken(token);
   await supabase.from("grameee_admin_sessions").delete().eq("token_hash", tokenHash);
   return jsonResponse({ ok: true });
+}
+
+async function handleUpdateInnovationGuildVendor(token: string, portalVendorId: string, updates: Record<string, unknown>) {
+  const supabase = getSupabaseAdmin();
+  const session = await validateSession(token);
+  if (!session) return errorResponse("Invalid admin session.", 401);
+  if (!portalVendorId) return errorResponse("Missing organization id.", 400);
+
+  const cleanUpdates: Record<string, unknown> = {};
+  for (const field of EDITABLE_VENDOR_FIELDS) {
+    if (!(field in updates)) continue;
+    const value = requireString(updates[field]);
+    cleanUpdates[field] = value || null;
+  }
+  if (!Object.keys(cleanUpdates).length) return errorResponse("No valid fields were provided for update.", 400);
+
+  cleanUpdates.updated_at = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("innovation_guild_vendors")
+    .update(cleanUpdates)
+    .eq("portal_vendor_id", portalVendorId)
+    .select("*")
+    .single();
+  if (error) return errorResponse(`Organization update failed: ${error.message}`, 500);
+  return jsonResponse({ ok: true, item: data });
 }
 
 function innovationHeaders() {
@@ -657,6 +695,10 @@ Deno.serve(async (request) => {
   const action = requireString(body.action);
   const token = requireString(body.token);
   const password = requireString(body.password);
+  const portalVendorId = requireString(body.portalVendorId);
+  const updates = (body.updates && typeof body.updates === "object" && !Array.isArray(body.updates))
+    ? body.updates as Record<string, unknown>
+    : {};
 
   switch (action) {
     case "login":
@@ -669,6 +711,8 @@ Deno.serve(async (request) => {
       return await handleListInnovationSyncRuns(token);
     case "syncInnovationGuildDirectory":
       return await handleSyncInnovationGuildDirectory(token);
+    case "updateInnovationGuildVendor":
+      return await handleUpdateInnovationGuildVendor(token, portalVendorId, updates);
     default:
       return errorResponse("Unknown admin action.", 400);
   }
