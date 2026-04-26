@@ -448,20 +448,39 @@ function getSeedMap() {
 
 function mergeContactDetails(seed: ContactSeedRecord | undefined, derivedAddress: string, sourceUrl: string) {
   const websiteDetails = safeUrl(requireString(seed?.website_details));
+  const websiteEmail = requireString(seed?.website_email);
+  const websitePhone = requireString(seed?.website_phone);
+  const websiteAddress = requireString(seed?.website_address);
+  const finalEmail = requireString(seed?.final_contact_email);
+  const finalPhone = requireString(seed?.final_contact_phone);
+  const explicitFinalAddress = requireString(seed?.final_contact_address);
+  const contactSourceUrl = requireString(seed?.contact_source_url);
+  const websiteStatus = requireString(seed?.website_status);
+  const contactNotes = requireString(seed?.contact_notes);
   return {
     websiteDetails: websiteDetails || null,
-    websiteEmail: requireString(seed?.website_email) || null,
-    websitePhone: requireString(seed?.website_phone) || null,
-    websiteAddress: requireString(seed?.website_address) || null,
-    finalEmail: requireString(seed?.final_contact_email) || null,
-    finalPhone: requireString(seed?.final_contact_phone) || null,
-    finalAddress: requireString(seed?.final_contact_address) || derivedAddress || null,
-    contactSourceUrl: requireString(seed?.contact_source_url) || sourceUrl || null,
-    websiteStatus: requireString(seed?.website_status) || (websiteDetails ? "Seed website listed" : "Innovation Guild API does not expose website/email/phone"),
-    contactNotes: requireString(seed?.contact_notes) || "Address captured from Innovation Guild. Email and phone can be enriched via organization-contact-seed.json when available.",
+    websiteEmail: websiteEmail || null,
+    websitePhone: websitePhone || null,
+    websiteAddress: websiteAddress || null,
+    finalEmail: finalEmail || null,
+    finalPhone: finalPhone || null,
+    finalAddress: explicitFinalAddress || derivedAddress || null,
+    contactSourceUrl: contactSourceUrl || sourceUrl || null,
+    websiteStatus: websiteStatus || (websiteDetails ? "Seed website listed" : "Innovation Guild API does not expose website/email/phone"),
+    contactNotes: contactNotes || "Address captured from Innovation Guild. Email and phone can be enriched via organization-contact-seed.json when available.",
     latitude: toUsableCoordinate(seed?.latitude),
     longitude: toUsableCoordinate(seed?.longitude),
     portalVendorLink: safeUrl(requireString(seed?.portal_vendor_link)) || "",
+    hasWebsiteDetails: Boolean(websiteDetails),
+    hasWebsiteEmail: Boolean(websiteEmail),
+    hasWebsitePhone: Boolean(websitePhone),
+    hasWebsiteAddress: Boolean(websiteAddress),
+    hasFinalEmail: Boolean(finalEmail),
+    hasFinalPhone: Boolean(finalPhone),
+    hasExplicitFinalAddress: Boolean(explicitFinalAddress),
+    hasContactSourceUrl: Boolean(contactSourceUrl),
+    hasWebsiteStatus: Boolean(websiteStatus),
+    hasContactNotes: Boolean(contactNotes),
   };
 }
 
@@ -483,6 +502,50 @@ async function upsertInBatches(table: string, rows: Record<string, unknown>[], o
     const { error } = await supabase.from(table).upsert(batch, { onConflict });
     if (error) throw new Error(`${table} upsert failed: ${error.message}`);
   }
+}
+
+async function loadExistingVendors(vendorIds: string[]) {
+  const supabase = getSupabaseAdmin();
+  const items = new Map<string, Record<string, unknown>>();
+  for (let index = 0; index < vendorIds.length; index += 100) {
+    const batch = vendorIds.slice(index, index + 100).filter(Boolean);
+    if (!batch.length) continue;
+    const { data, error } = await supabase
+      .from("innovation_guild_vendors")
+      .select("*")
+      .in("portal_vendor_id", batch);
+    if (error) throw new Error(`innovation_guild_vendors load failed: ${error.message}`);
+    for (const item of data || []) {
+      const vendorId = requireString(item.portal_vendor_id);
+      if (vendorId) items.set(vendorId, item as Record<string, unknown>);
+    }
+  }
+  return items;
+}
+
+function preferExistingContactValue(existingValue: unknown, nextValue: unknown, shouldOverwrite: boolean) {
+  const existingText = requireString(existingValue);
+  const nextText = requireString(nextValue);
+  if (shouldOverwrite && nextText) return nextText;
+  if (existingText) return existingText;
+  return nextText || null;
+}
+
+function preserveManualContactFields(row: Record<string, unknown>, existingVendor: Record<string, unknown> | undefined, mergedContacts: ReturnType<typeof mergeContactDetails>) {
+  if (!existingVendor) return row;
+  return {
+    ...row,
+    website_details: preferExistingContactValue(existingVendor.website_details, row.website_details, mergedContacts.hasWebsiteDetails),
+    website_email: preferExistingContactValue(existingVendor.website_email, row.website_email, mergedContacts.hasWebsiteEmail),
+    website_phone: preferExistingContactValue(existingVendor.website_phone, row.website_phone, mergedContacts.hasWebsitePhone),
+    website_address: preferExistingContactValue(existingVendor.website_address, row.website_address, mergedContacts.hasWebsiteAddress),
+    final_contact_email: preferExistingContactValue(existingVendor.final_contact_email, row.final_contact_email, mergedContacts.hasFinalEmail),
+    final_contact_phone: preferExistingContactValue(existingVendor.final_contact_phone, row.final_contact_phone, mergedContacts.hasFinalPhone),
+    final_contact_address: preferExistingContactValue(existingVendor.final_contact_address, row.final_contact_address, mergedContacts.hasExplicitFinalAddress),
+    contact_source_url: preferExistingContactValue(existingVendor.contact_source_url, row.contact_source_url, mergedContacts.hasContactSourceUrl),
+    website_status: preferExistingContactValue(existingVendor.website_status, row.website_status, mergedContacts.hasWebsiteStatus),
+    contact_notes: preferExistingContactValue(existingVendor.contact_notes, row.contact_notes, mergedContacts.hasContactNotes),
+  };
 }
 
 async function handleListInnovationSyncRuns(token: string) {
@@ -566,6 +629,8 @@ async function handleSyncInnovationGuildDirectory(token: string) {
       };
     }).filter((row) => row.portal_product_id && row.portal_vendor_id);
 
+    const existingVendorMap = await loadExistingVendors(productRows.map((row) => requireString(row.portal_vendor_id)));
+
     const rawVendorRows = uniqueBy(productRows.map((product) => {
       const detail = product.raw_product.detail as InnovationDetail;
       const orgDetails = detail.opportunityOrgDetails as Record<string, unknown> | undefined;
@@ -591,7 +656,8 @@ async function handleSyncInnovationGuildDirectory(token: string) {
         finalAddress || derivedAddress,
         ...serviceLocations,
       ]).join(" | ");
-      return {
+      const existingVendor = existingVendorMap.get(vendorId);
+      const assembledRow = {
         portal_vendor_id: vendorId,
         vendor_name: vendorName,
         about_vendor: decodeHtml(orgDetails?.organisationDescription || detail.longDescription) || null,
@@ -634,6 +700,19 @@ async function handleSyncInnovationGuildDirectory(token: string) {
         },
         synced_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
+      };
+      const mergedRow = preserveManualContactFields(assembledRow, existingVendor, mergedContacts);
+      return {
+        ...mergedRow,
+        search_text: dedupe([
+          vendorName,
+          decodeHtml(orgDetails?.organisationDescription),
+          requireString(mergedRow.location_text),
+          requireString(mergedRow.final_contact_address),
+          requireString(mergedRow.final_contact_email),
+          requireString(mergedRow.final_contact_phone),
+          ...linkedProducts.flatMap((entry) => [entry.product_name, entry.product_description || "", ...(entry.tags || []), ...(entry.product_categories || []), ...(entry.product_subcategories || [])]),
+        ]).join(" "),
       };
     }), (row) => requireString(row.portal_vendor_id));
 
