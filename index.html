@@ -17,6 +17,17 @@
         <h1>Organization and Machine Search</h1>
         <p class="vendor-subtitle">Search Innovation Guild Organizations, Machines, Specifications, Keywords, and Service Locations</p>
       </div>
+      <div class="vendor-hero-actions vendor-hero-summary">
+        <section class="section vendor-hero-summary-card">
+          <h3>Directory Summary</h3>
+          <div class="stats-grid">
+            <div class="stat-card"><div class="stat-number" id="vendor-total-count">0</div><div>Organizations</div></div>
+            <div class="stat-card"><div class="stat-number" id="product-total-count">0</div><div>Machines</div></div>
+            <div class="stat-card"><div class="stat-number" id="filtered-vendor-count">0</div><div>Matches</div></div>
+          </div>
+          <p class="section-note" id="directory-status">Loading Innovation Guild directory...</p>
+        </section>
+      </div>
     </header>
 
     <main class="vendor-layout">
@@ -34,15 +45,6 @@
           </div>
         </section>
 
-        <section class="section">
-          <h3>Directory Summary</h3>
-          <div class="stats-grid">
-            <div class="stat-card"><div class="stat-number" id="vendor-total-count">0</div><div>Organizations</div></div>
-            <div class="stat-card"><div class="stat-number" id="product-total-count">0</div><div>Machines</div></div>
-            <div class="stat-card"><div class="stat-number" id="filtered-vendor-count">0</div><div>Matches</div></div>
-          </div>
-          <p class="section-note" id="directory-status">Loading Innovation Guild directory...</p>
-        </section>
       </aside>
 
       <section class="vendor-results-shell">
@@ -55,7 +57,6 @@
           </div>
           <div class="vendor-map-grid">
             <div id="results-map" class="vendor-map-canvas"></div>
-            <div id="map-results-list" class="vendor-map-list"></div>
           </div>
         </div>
 
@@ -67,7 +68,9 @@
             </div>
           </div>
           <div id="results-pagination-top" class="vendor-pagination"></div>
-          <div id="vendor-results" class="vendor-results-list"></div>
+          <div class="vendor-results-panel">
+            <div id="vendor-results" class="vendor-results-list"></div>
+          </div>
           <div id="results-pagination-bottom" class="vendor-pagination"></div>
         </div>
       </section>

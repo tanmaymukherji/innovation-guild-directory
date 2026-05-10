@@ -24,7 +24,6 @@ const searchEls = {
 };
 
 const resultsEl = document.getElementById('vendor-results');
-const mapListEl = document.getElementById('map-results-list');
 const statusEl = document.getElementById('directory-status');
 const resultsSummaryEl = document.getElementById('results-summary');
 const paginationEls = [
@@ -255,9 +254,6 @@ function setSelectedVendor(vendorId) {
   document.querySelectorAll('[data-vendor-card]').forEach((card) => {
     card.classList.toggle('active', card.dataset.vendorCard === vendorId);
   });
-  document.querySelectorAll('[data-focus-vendor]').forEach((item) => {
-    item.classList.toggle('active', item.dataset.focusVendor === vendorId);
-  });
 }
 
 function focusVendor(vendorId, options = {}) {
@@ -418,11 +414,6 @@ async function renderMapMarkers(vendors) {
     if (point) points.push({ vendor, point });
   }
   if (!points.length) {
-    if (!vendors.length) {
-      mapListEl.innerHTML = '<div class="vendor-map-status">No mappable coordinates were available for the current search yet.</div>';
-    } else {
-      mapListEl.insertAdjacentHTML('afterbegin', '<div class="vendor-map-status">Matching organizations are listed here, but no usable coordinates could be derived from the current data yet.</div>');
-    }
     directoryState.map?.setCenter?.(INDIA_CENTER);
     directoryState.map?.setZoom?.(4.8);
     return;
@@ -486,13 +477,11 @@ async function renderResults() {
   const mapVendors = directoryState.hasSearched ? directoryState.filteredVendors : [];
   setCounts();
   resultsEl.innerHTML = '';
-  mapListEl.innerHTML = '';
   renderPagination(totalPages, totalMatches);
 
   if (!directoryState.hasSearched) {
     resultsSummaryEl.textContent = 'Enter an organization, machine, specification, location, or keyword to search the directory.';
     resultsEl.innerHTML = '<div class="vendor-empty-state">The directory is loaded and ready. Start with a keyword or one of the filters on the left, then run the search to see matching Innovation Guild organizations.</div>';
-    mapListEl.innerHTML = '<div class="vendor-map-status">Run a search to display matching organization locations on the map.</div>';
     await renderMapMarkers([]);
     return;
   }
@@ -500,20 +489,11 @@ async function renderResults() {
   if (!totalMatches) {
     resultsSummaryEl.textContent = 'No organizations matched the current filters.';
     resultsEl.innerHTML = '<div class="vendor-empty-state">No organizations match this combination yet. Try a shorter keyword, a broader location, or remove one filter at a time.</div>';
-    mapListEl.innerHTML = '<div class="vendor-map-status">No map results for the current search.</div>';
     await renderMapMarkers([]);
     return;
   }
 
   resultsSummaryEl.textContent = `${totalMatches} organization result${totalMatches === 1 ? '' : 's'} found. Page ${directoryState.currentPage} of ${totalPages}.`;
-
-  mapVendors.forEach((vendor, index) => {
-    const coverageSummary = getCoverageSummary(vendor);
-    const secondaryLine = vendor.final_contact_address && normalizeText(vendor.final_contact_address) !== normalizeText(coverageSummary)
-      ? vendor.final_contact_address
-      : vendor.final_contact_email || 'Contact details available on detail page';
-    mapListEl.insertAdjacentHTML('beforeend', `<div class="vendor-map-list-item" data-focus-vendor="${esc(vendor.portal_vendor_id)}"><span class="vendor-flag">${index + 1}</span><span><strong>${esc(vendor.vendor_name)}</strong><br /><small>${esc(coverageSummary)}</small><br /><small>${esc(secondaryLine)}</small></span><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></div>`);
-  });
 
   pageVendors.forEach((vendor) => {
     const productPreview = (vendor.products || []).slice(0, 4).map((product) => product.product_name).filter(Boolean);
@@ -521,10 +501,7 @@ async function renderResults() {
     const contactLine = [vendor.final_contact_email || vendor.portal_email || 'No email', vendor.final_contact_phone || vendor.portal_phone || 'No phone'].join(' | ');
     const noteLine = vendor.contact_notes || vendor.website_status || 'Innovation Guild contacts only';
     const coverageSummary = getCoverageSummary(vendor);
-    const addressLine = vendor.final_contact_address && normalizeText(vendor.final_contact_address) !== normalizeText(coverageSummary)
-      ? `<p><strong>Address:</strong> ${esc(vendor.final_contact_address)}</p>`
-      : '';
-    resultsEl.insertAdjacentHTML('beforeend', `<article class="vendor-result-card" data-vendor-card="${esc(vendor.portal_vendor_id)}"><div class="vendor-result-top"><div><h4>${esc(vendor.vendor_name)}</h4><p>${esc(coverageSummary)}</p></div><span class="admin-badge approved">${esc(String(vendor.products_count || vendor.products?.length || 0))} machines</span></div><p>${esc(vendor.about_vendor || 'No description available.')}</p><p><strong>Service locations:</strong> ${esc((vendor.service_locations || []).join(', ') || 'Not listed')}</p><p><strong>Contact:</strong> ${esc(contactLine)}</p>${addressLine}<p><strong>Enrichment:</strong> ${esc(noteLine)}</p><p><strong>Machines:</strong> ${esc(productPreview.join(', ') || 'No machines listed')}${productExtra ? ` +${productExtra} more` : ''}</p><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></article>`);
+    resultsEl.insertAdjacentHTML('beforeend', `<article class="vendor-result-card" data-vendor-card="${esc(vendor.portal_vendor_id)}"><div class="vendor-result-header"><div class="vendor-result-topline"><div class="vendor-result-heading"><h4>${esc(vendor.vendor_name)}</h4><p>${esc(coverageSummary)}</p></div><div class="vendor-result-meta"><span class="admin-badge approved">${esc(String(vendor.products_count || vendor.products?.length || 0))} machines</span></div></div><div class="vendor-result-actions"><div class="btn-group"><a class="btn btn-small" href="./vendor-detail.html?vendor=${encodeURIComponent(vendor.portal_vendor_id)}">View Details</a><a class="btn btn-warning btn-small" href="${esc(vendor.portal_vendor_link || '#')}" target="_blank" rel="noreferrer">Open Innovation Guild</a></div></div></div><div class="vendor-result-body"><p>${esc(vendor.about_vendor || 'No description available.')}</p><p><strong>Service locations:</strong> ${esc((vendor.service_locations || []).join(', ') || 'Not listed')}</p><p><strong>Contact:</strong> ${esc(contactLine)}</p><p><strong>Address:</strong> ${esc(vendor.final_contact_address || 'Not listed')}</p><p><strong>Enrichment:</strong> ${esc(noteLine)}</p><p><strong>Machines:</strong> ${esc(productPreview.join(', ') || 'No machines listed')}${productExtra ? ` +${productExtra} more` : ''}</p></div></article>`);
   });
 
   const selectedVendor = directoryState.selectedVendorId && mapVendors.some((vendor) => vendor.portal_vendor_id === directoryState.selectedVendorId)
@@ -599,11 +576,6 @@ Object.values(searchEls).forEach((input) => {
   input.addEventListener('keypress', (event) => { if (event.key === 'Enter') applyFilters(); });
   input.addEventListener('input', persistSearchState);
   input.addEventListener('change', persistSearchState);
-});
-mapListEl.addEventListener('click', (event) => {
-  if (event.target.closest('a')) return;
-  const target = event.target.closest('[data-focus-vendor]');
-  if (target) focusVendor(target.dataset.focusVendor);
 });
 resultsEl.addEventListener('click', (event) => {
   if (event.target.closest('a')) return;
